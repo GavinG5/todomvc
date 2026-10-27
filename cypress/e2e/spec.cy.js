@@ -71,7 +71,6 @@ const noLocalStorageCheck = {
   preact: true,
   puremvc: true,
   rappidjs: true,
-  react: true,
   'react-redux': true,
   reagent: true,
   serenadejs: true,
@@ -106,6 +105,13 @@ const storageSetDoesNotMeanAppStarted = {
 // check localStorage for keywords like "complete" or "isComplete"
 const badLocalStorageFormat = {
   js_of_ocaml: true
+}
+
+// Apps that recover from unreadable saved data instead of failing to start.
+// Most examples parse their localStorage blob without guarding it, and the
+// app spec does not ask them to, so this is opt-in.
+const survivesCorruptStorage = {
+  react: true
 }
 
 // some frameworks really rely on "blur" event
@@ -385,7 +391,9 @@ Cypress._.times(N, () => {
       }
       cy.wrap(localStorageSetItem, {log: false})
         .should('have.been.called')
-      cy.wrap(localStorageSetItem, {log: false}).invoke('reset')
+      // `reset` on a spy was removed in sinon 5; the surviving call-history
+      // reset is `resetHistory`.
+      cy.wrap(localStorageSetItem, {log: false}).invoke('resetHistory')
     }
 
     let currentTestId
@@ -931,19 +939,24 @@ Cypress._.times(N, () => {
         // mimicking TodoMVC tests
         // by writing out this function
         function testState () {
+          // Re-query rather than aliasing the list items: cy.reload()
+          // detaches every node, and Cypress 12+ refuses to commands-chain
+          // through detached subjects.
           cy
-            .get('@firstTodo')
+            .get(selectors.todoItems)
+            .eq(0)
             .should('contain', TODO_ITEM_ONE)
             .and('have.class', 'completed')
           cy
-            .get('@secondTodo')
+            .get(selectors.todoItems)
+            .eq(1)
             .should('contain', TODO_ITEM_TWO)
             .and('not.have.class', 'completed')
         }
 
-        cy.createTodo(TODO_ITEM_ONE).as('firstTodo')
-        cy.createTodo(TODO_ITEM_TWO).as('secondTodo')
-        cy.get('@firstTodo').find('.toggle').check().then(testState)
+        cy.createTodo(TODO_ITEM_ONE)
+        cy.createTodo(TODO_ITEM_TWO)
+        cy.get(selectors.todoItems).eq(0).find('.toggle').check().then(testState)
         // at this point, the app might still not save
         // the items in the local storage, for example KnockoutJS
         // first recomputes the items and still have "[]"
@@ -955,6 +968,150 @@ Cypress._.times(N, () => {
 
         // now can reload
         cy.reload().then(testState)
+      })
+
+      it('should keep an edited todo after a reload', function () {
+        if (noLocalStorageCheck[framework]) {
+          this.skip()
+        }
+
+        cy.createTodo(TODO_ITEM_ONE)
+        cy.get(selectors.todoItems).eq(0).find('label').dblclick()
+        cy
+          .get(selectors.todoItems)
+          .eq(0)
+          .find('.edit')
+          .clear()
+          .type('buy some sausages{enter}')
+          .then(safeBlur)
+
+        cy.get(selectors.todoItems).eq(0).should('contain', 'buy some sausages')
+        checkTodosInLocalStorage('buy some sausages')
+
+        // Re-query after the reload rather than aliasing - cy.reload()
+        // detaches every node, and Cypress 12+ refuses to commands-chain
+        // through detached subjects.
+        cy.reload()
+        cy.get(selectors.todoItems).should('have.length', 1)
+        cy.get(selectors.todoItems).eq(0).should('contain', 'buy some sausages')
+      })
+
+      it('should keep a deleted todo deleted after a reload', function () {
+        if (noLocalStorageCheck[framework]) {
+          this.skip()
+        }
+
+        cy.createTodo(TODO_ITEM_ONE)
+        cy.createTodo(TODO_ITEM_TWO)
+        // The destroy button is only shown on hover, which Cypress cannot
+        // genuinely simulate - click it regardless.
+        cy.get(selectors.todoItems).eq(0).find('.destroy').click({force: true})
+
+        cy.get(selectors.todoItems).should('have.length', 1)
+        checkNumberOfTodosInLocalStorage(1)
+
+        cy.reload()
+        cy.get(selectors.todoItems).should('have.length', 1)
+        cy.get(selectors.todoItems).eq(0).should('contain', TODO_ITEM_TWO)
+      })
+
+      it('should keep cleared completed todos removed after a reload', function () {
+        if (noLocalStorageCheck[framework]) {
+          this.skip()
+        }
+
+        cy.createTodo(TODO_ITEM_ONE)
+        cy.createTodo(TODO_ITEM_TWO)
+        cy.get(selectors.todoItems).eq(0).find('.toggle').check()
+        cy.get(selectors.clearCompleted).click()
+
+        cy.get(selectors.todoItems).should('have.length', 1)
+        checkNumberOfTodosInLocalStorage(1)
+
+        cy.reload()
+        cy.get(selectors.todoItems).should('have.length', 1)
+        cy.get(selectors.todoItems).eq(0).should('contain', TODO_ITEM_TWO)
+      })
+
+      it('should stay empty after a reload', function () {
+        if (noLocalStorageCheck[framework]) {
+          this.skip()
+        }
+
+        hasNoItems()
+
+        cy.reload()
+        cy.get(selectors.newTodo).should('be.visible')
+        hasNoItems()
+        cy.get(selectors.main).should('not.be.visible')
+      })
+
+      // The outer beforeEach has already visited the app, so seed storage
+      // through the live window and reload instead of visiting again - that
+      // keeps the setItem wrapper's test-id check happy.
+      const seedStorage = saved => {
+        cy.window().then(win => {
+          win.localStorage.setItem(`todos-${framework}`, saved)
+        })
+        cy.reload()
+      }
+
+      // Saved values another tab, an older version, or a curious user could
+      // leave behind. None of them should stop the app from starting.
+      const unreadableSavedData = {
+        'is not JSON': 'not json at all',
+        'is a JSON object rather than a list': '{"todos": []}',
+        'is a JSON string rather than a list': '"buy some cheese"',
+        'is a list of things that are not todos': '[null, 42, "buy some cheese", []]',
+        'holds a todo whose title is not text': '[{"id": "a", "title": {"text": "x"}}]'
+      }
+
+      Cypress._.forEach(unreadableSavedData, (saved, description) => {
+        it(`should start empty and still work when saved data ${description}`, function () {
+          if (!survivesCorruptStorage[framework]) {
+            this.skip()
+          }
+
+          seedStorage(saved)
+
+          // An app that threw while rendering would leave an empty page, so
+          // the input being visible is the "it did not crash" assertion.
+          cy.get(selectors.newTodo).should('be.visible')
+          hasNoItems()
+
+          cy.createTodo(TODO_ITEM_ONE)
+          cy.get(selectors.todoItems).should('have.length', 1)
+
+          cy.reload()
+          cy.get(selectors.todoItems).should('have.length', 1)
+          cy.get(selectors.todoItems).eq(0).should('contain', TODO_ITEM_ONE)
+        })
+      })
+
+      it('should keep only the readable todos from partly broken saved data', function () {
+        if (!survivesCorruptStorage[framework]) {
+          this.skip()
+        }
+
+        seedStorage(
+          JSON.stringify([
+            {id: 'a', title: TODO_ITEM_ONE},
+            {id: 'b'},
+            {id: 'c', title: TODO_ITEM_TWO, completed: true}
+          ])
+        )
+
+        cy.get(selectors.todoItems).should('have.length', 2)
+        cy
+          .get(selectors.todoItems)
+          .eq(0)
+          .should('contain', TODO_ITEM_ONE)
+          .and('not.have.class', 'completed')
+        cy
+          .get(selectors.todoItems)
+          .eq(1)
+          .should('contain', TODO_ITEM_TWO)
+          .and('have.class', 'completed')
       })
     })
 
